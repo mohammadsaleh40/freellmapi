@@ -23,7 +23,10 @@
     "db:migration:create": "npm run db:migration:create -w server"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
+    "esbuild": "^0.28.1"
   },
   "engines": {
     "node": ">=20.18.0 <25.0.0",
