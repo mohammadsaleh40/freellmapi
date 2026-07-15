@@ -85,6 +85,19 @@ export type Platform =
   // ~10M tokens/month free allocation (no card); quota unverified. Key from
   // ainative.studio.
   | 'ainative'
+  // Aion Labs — OpenAI-compatible aggregator with a no-card free API key.
+  // Catalog rows live in the Oracle catalog (premium now, free after 30 days).
+  | 'aion'
+  // Requesty — OpenAI-compatible router with no-card free models/credits.
+  // Catalog rows live in the Oracle catalog (premium now, free after 30 days).
+  | 'requesty'
+  // NavyAI — OpenAI-compatible unified API. Free plan is 150K tokens/day and
+  // 20 RPM; catalog rows live in the Oracle catalog (premium now, free after 30 days).
+  | 'navy'
+  // NaraRouter — OpenAI-compatible aggregator. Free account key from
+  // router.bynara.id after Telegram channel/link verification; free-plan routes
+  // reset daily and are catalog-managed (premium now, free after 30 days).
+  | 'nara'
   // AI Horde — free, community-powered inference (volunteer workers) via an
   // OpenAI-compatible proxy (https://oai.aihorde.net/v1). Queue-based, so calls
   // can take tens of seconds; no tool support; usage is reported as kudos, not
@@ -288,6 +301,9 @@ export interface ChatCompletionChoice {
   index: number;
   message: ChatMessage;
   finish_reason: string | null;
+  // Present when the client requested logprobs and the provider returned
+  // them; passed through verbatim (provider shapes vary slightly).
+  logprobs?: unknown;
 }
 
 export interface TokenUsage {
@@ -319,6 +335,7 @@ export interface ChatCompletionChunk {
     delta: {
       role?: 'assistant';
       content?: string;
+      reasoning_content?: string;
       tool_calls?: ChatToolCall[];
     };
     finish_reason: string | null;
