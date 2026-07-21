@@ -16,6 +16,7 @@ import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandof
 import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
+import { captureRequestBody, logDetailedEvent, summarizeResponse, getLogPath } from '../lib/detailed-log.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError, setFallbackHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
@@ -998,6 +999,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  captureRequestBody(requestGroupId, parsed.data);
+
   const { model: requestedModel, temperature, top_p, stream } = parsed.data;
   const requestedModelLabel = requestedModel ?? 'auto';
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no
@@ -1722,6 +1725,27 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens + injectedHandoffTokens,
             outputTokens: totalOutputTokens,
           });
+          logDetailedEvent({
+            event: 'ok',
+            requestId: requestGroupId,
+            attempt,
+            keyId: route.keyId,
+            platform: route.platform,
+            model: route.modelId,
+            requestedModel: requestedModelLabel,
+            latencyMs: Date.now() - start,
+            inputTokens: estimatedInputTokens + injectedHandoffTokens,
+            outputTokens: totalOutputTokens,
+            response: {
+              stream: true,
+              has_text: heldText.length > 0,
+              has_tool_calls: completedCalls.length > 0,
+              text_preview: heldText.length > 0
+                ? (heldText.slice(0, 300) + (heldText.length > 300 ? '...[TRUNCATED]' : ''))
+                : null,
+              finish_reason: upstreamFinish ?? null,
+            },
+          });
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return 'done';
         } catch (streamErr: any) {
@@ -1739,6 +1763,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               platform: route.platform,
               model: route.modelId,
               latencyMs: Date.now() - start,
+              error: sanitizeProviderErrorMessage(streamErr.message),
+            });
+            logDetailedEvent({
+              event: 'fail',
+              requestId: requestGroupId,
+              attempt,
+              keyId: route.keyId,
+              platform: route.platform,
+              model: route.modelId,
+              requestedModel: requestedModelLabel,
+              latencyMs: Date.now() - start,
+              inputTokens: estimatedInputTokens,
+              outputTokens: totalOutputTokens ?? 0,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId);
@@ -1890,6 +1927,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           inputTokens: promptTokens,
           outputTokens: completionTokens,
         });
+        logDetailedEvent({
+          event: 'ok',
+          requestId: requestGroupId,
+          attempt,
+          keyId: route.keyId,
+          platform: route.platform,
+          model: route.modelId,
+          requestedModel: requestedModelLabel,
+          latencyMs: Date.now() - start,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          response: summarizeResponse(result),
+        });
         logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
         return 'done';
       }
@@ -1904,6 +1954,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         platform: route.platform,
         model: route.modelId,
         latencyMs: latency,
+        error: safeError,
+      });
+      logDetailedEvent({
+        event: 'fail',
+        requestId: requestGroupId,
+        attempt,
+        keyId: route.keyId,
+        platform: route.platform,
+        model: route.modelId,
+        requestedModel: requestedModelLabel,
+        latencyMs: latency,
+        inputTokens: estimatedInputTokens,
+        outputTokens: 0,
         error: safeError,
       });
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
