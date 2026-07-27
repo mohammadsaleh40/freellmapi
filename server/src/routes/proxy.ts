@@ -2165,7 +2165,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           inputTokens: promptTokens,
           outputTokens: completionTokens,
         });
-<<<<<<< HEAD
         logDetailedEvent({
           event: 'ok',
           requestId: requestGroupId,
@@ -2180,10 +2179,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           response: summarizeResponse(result),
         });
         logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
-=======
-        logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId,
-          observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }));
->>>>>>> upstream/main
         return 'done';
       }
     },
