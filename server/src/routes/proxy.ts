@@ -1944,7 +1944,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens + injectedHandoffTokens,
             outputTokens: totalOutputTokens,
           });
-<<<<<<< HEAD
           logDetailedEvent({
             event: 'ok',
             requestId: requestGroupId,
@@ -1967,10 +1966,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             },
           });
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
-=======
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId,
-            observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }));
->>>>>>> upstream/main
           return 'done';
         } catch (streamErr: any) {
           // Client abort mid-stream: the pump's own `if (clientGone) break`
