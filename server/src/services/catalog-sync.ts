@@ -523,7 +523,10 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       }
     }
 
-    if (catalog.embeddings) {
+    // Only prune embedding models when the catalog actually carries some.
+    // An empty array means "no embeddings managed in this tier" — keep the
+    // app's bundled baseline (from migrateEmbeddingsV1) untouched.
+    if (catalog.embeddings && catalog.embeddings.length > 0) {
       const embeddingCandidates = db
         .prepare(`
           SELECT id, platform, model_id
