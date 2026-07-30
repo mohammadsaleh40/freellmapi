@@ -15,6 +15,8 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
+import { resolveCombo } from '../services/combos.js';
+import { nextRoundRobinModel } from '../services/round-robin.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { captureRequestBody, logDetailedEvent, summarizeResponse, getLogPath } from '../lib/detailed-log.js';
@@ -41,6 +43,16 @@ function isAutoModel(modelId: string | undefined): boolean {
   if (!modelId) return true;
   const lower = modelId.toLowerCase();
   return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+}
+
+/** True when the model id is a user-defined combo name (not 'auto', 'fusion', or a platform:model_id pair). */
+function isComboModel(modelId: string | undefined): boolean {
+  if (!modelId) return false;
+  const lower = modelId.toLowerCase();
+  if (lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`)) return false;
+  if (lower === FUSION_MODEL_ID || lower.startsWith(`${FUSION_MODEL_ID}:`)) return false;
+  if (modelId.includes('/')) return false;
+  return resolveCombo(getDb(), modelId) !== null;
 }
 
 // Constant-time string comparison for the unified API key. Plain `===` leaks
@@ -1471,6 +1483,107 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  // ── Combo: named model groups ──────────────────────────────────────────────
+  // A combo is a user-defined ordered list of models with a routing strategy.
+  // Fusion combos are handled immediately (early return). Fallback and
+  // round-robin combos inject state consumed by the model-resolution block below.
+  const resolvedCombo = requestedModel && !isAutoModel(requestedModel) && !isFusionModel(requestedModel)
+    ? resolveCombo(getDb(), requestedModel)
+    : null;
+
+  if (resolvedCombo && resolvedCombo.strategy === 'fusion') {
+    if (hasImage) {
+      res.status(422).json({
+        error: {
+          message: `Combo "${resolvedCombo.name}" uses fusion strategy, which does not support image input yet. Use a vision model or a fallback-strategy combo directly.`,
+          type: 'invalid_request_error',
+          code: 'combo_fusion_no_vision',
+        },
+      });
+      return;
+    }
+    const fusionOptions = { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams };
+    const comboFusionConfig = {
+      models: resolvedCombo.models,
+      judge: resolvedCombo.judgeModel ?? undefined,
+      strategy: 'synthesize' as const,
+      expose_panel: false,
+    };
+
+    if (stream) {
+      // ── Streaming fusion combo ──
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const writeFrame = (o: unknown) => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch { /* socket gone */ } };
+      const streamId = `combo-${resolvedCombo.name}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const base = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: resolvedCombo.name };
+      let answerStarted = false;
+      try {
+        const { response } = await runFusion({
+          messages, config: comboFusionConfig, options: fusionOptions, estimatedTokens: estimatedTotal,
+          hooks: {
+            onPanel: (a) => writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: null }], _fusion: { event: 'panel', ...a } }),
+            onJudge: (j) => writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: null }], _fusion: { event: 'judge', ...j } }),
+            onJudgeDelta: (delta) => {
+              if (!answerStarted) { writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }); answerStarted = true; }
+              writeFrame({ ...base, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
+            },
+          },
+        });
+        const finalMsg = response.choices[0]?.message;
+        const finalToolCalls = (finalMsg as { tool_calls?: ChatToolCall[] } | undefined)?.tool_calls;
+        const hasFinalToolCalls = Array.isArray(finalToolCalls) && finalToolCalls.length > 0;
+        if (hasFinalToolCalls) {
+          writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+          writeFrame({ ...base, choices: [{ index: 0, delta: { tool_calls: finalToolCalls }, finish_reason: null }] });
+          writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: response.usage });
+        } else {
+          if (!answerStarted) {
+            const finalText = contentToString(finalMsg?.content ?? '');
+            writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+            writeFrame({ ...base, choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }] });
+          }
+          writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: response.usage });
+        }
+      } catch (err: any) {
+        const message = err instanceof FusionError ? err.message : `combo fusion error: ${sanitizeProviderErrorMessage(err?.message)}`;
+        const type = err instanceof FusionError && err.status === 429 ? 'rate_limit_error' : 'server_error';
+        writeFrame({ error: { message, type } });
+      }
+      try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+      return;
+    }
+
+    // ── Non-streaming fusion combo ──
+    try {
+      const { response, routedVia } = await runFusion({
+        messages, config: comboFusionConfig, options: fusionOptions, estimatedTokens: estimatedTotal,
+      });
+      const fusionMsg = (response as any)?.choices?.[0]?.message;
+      if (samplingParams.response_format && fusionMsg && !fusionMsg.tool_calls?.length) {
+        const fusionText = contentToString(fusionMsg.content ?? '');
+        if (fusionText) {
+          const enforced = enforceJsonContent(fusionText);
+          if (!enforced.ok) {
+            res.status(502).json({ error: { message: `combo fusion produced non-JSON output despite response_format=${samplingParams.response_format.type} — retry, or use a non-fusion combo`, type: 'server_error' } });
+            return;
+          }
+          if (enforced.healed) fusionMsg.content = enforced.content;
+        }
+      }
+      res.setHeader('X-Routed-Via', `${resolvedCombo.name} (fusion): ${routedVia}`);
+      res.json(response);
+    } catch (err: any) {
+      if (err instanceof FusionError) {
+        res.status(err.status).json({ error: { message: err.message, type: err.status === 429 ? 'rate_limit_error' : 'invalid_request_error' } });
+      } else {
+        res.status(502).json({ error: { message: `combo fusion error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'server_error' } });
+      }
+    }
+    return;
+  }
+
   // ── Response cache (services/cache.ts) ──
   // Opt-in exact-match cache. An identical earlier request is replayed from an
   // in-memory LRU without spending any provider quota. Computed here, after
@@ -1563,6 +1676,104 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   if (isAutoModel(requestedModel)) {
     preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+  } else if (resolvedCombo && (resolvedCombo.strategy === 'fallback' || resolvedCombo.strategy === 'round-robin')) {
+    // ── Fallback / round-robin combo: build a strict chain from the combo's model list ──
+    // Fallback: the loop iterates only these models in order.
+    // Round-robin: picks exactly one model per request via rotation.
+    // Both override any auto-resolved chain.
+    const db = getDb();
+    const modelIds = resolvedCombo.models;
+
+    // Resolve each combo model to a DB id. When unify is ON, the combo's model
+    // list may contain canonical short names (e.g. 'gemini-2.5-flash') instead
+    // of catalog model_ids ('google/gemini-2.5-flash'). Resolve via model
+    // groups first, then fall back to exact model_id match.
+    const groups = isUnifyEnabled() ? getModelGroups() : null;
+    const resolvedDbIds: number[] = [];
+    const modelIdToDbId = new Map<string, number>();
+
+    for (const mid of modelIds) {
+      const members = groups ? resolveRequestedIdToMembers(mid, groups) : null;
+      if (members && members.length > 0) {
+        // Canonical name resolved — take the first member to represent it
+        resolvedDbIds.push(members[0]);
+        modelIdToDbId.set(mid, members[0]);
+      } else {
+        // Exact model_id fallback: map to any enabled row
+        const row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(mid) as { id: number } | undefined;
+        if (row) {
+          resolvedDbIds.push(row.id);
+          modelIdToDbId.set(mid, row.id);
+        }
+      }
+    }
+
+    if (resolvedDbIds.length === 0) {
+      res.status(503).json({
+        error: {
+          message: `Combo "${resolvedCombo.name}" has no enabled models. Enable at least one model in the combo.`,
+          type: 'service_unavailable',
+          code: 'combo_no_models',
+        },
+      });
+      return;
+    }
+
+    // Fetch full ChainRow[] for the resolved db ids, preserving combo order
+    const idPlaceholders = resolvedDbIds.map(() => '?').join(',');
+    const comboRows = db.prepare(`
+      SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
+             1 as enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id
+      FROM models m
+      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+      WHERE m.id IN (${idPlaceholders}) AND m.enabled = 1
+    `).all(...resolvedDbIds) as ChainRow[];
+
+    // Sort comboRows to match the combo's original model order
+    const dbIdOrder = new Map(resolvedDbIds.map((id, i) => [id, i]));
+    comboRows.sort((a, b) => (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999));
+
+    // ── Capability auto-switch ──
+    // If the request has images, reorder combo models to prefer vision-capable ones first.
+    if (hasImage && comboRows.length > 1) {
+      const visionModelIds = new Set(
+        (db.prepare(`SELECT DISTINCT model_id FROM models WHERE supports_vision = 1 AND enabled = 1`).all() as { model_id: string }[]).map(r => r.model_id)
+      );
+      comboRows.sort((a, b) => {
+        const aVision = visionModelIds.has(a.model_id) ? 0 : 1;
+        const bVision = visionModelIds.has(b.model_id) ? 0 : 1;
+        if (aVision !== bVision) return aVision - bVision;
+        return (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999);
+      });
+    }
+
+    if (resolvedCombo.strategy === 'round-robin') {
+      // ── Round-robin: pick exactly one model from the combo via rotation ──
+      const idx = nextRoundRobinModel(resolvedCombo.name, comboRows.length, resolvedCombo.stickyLimit);
+      const chosen = comboRows[idx];
+      if (!chosen) {
+        res.status(503).json({
+          error: {
+            message: `Combo "${resolvedCombo.name}" round-robin produced an empty slot.`,
+            type: 'server_error',
+            code: 'combo_rr_empty',
+          },
+        });
+        return;
+      }
+      preferredModel = chosen.model_db_id;
+      groupChain = undefined;
+      console.log(`[Proxy] Round-robin combo "${resolvedCombo.name}" → ${chosen.model_id} (index ${idx}, ${comboRows.length} models)`);
+    } else {
+      // ── Fallback: use the full combo model list as a strict chain ──
+      // The SQL query above already returns ChainRow-compatible data.
+      groupChain = comboRows;
+      preferredModel = undefined;
+    }
   } else if (requestedModel) {
     const db = getDb();
     // Unify ON: a requested id (canonical slug OR any provider's model_id) maps
@@ -1626,9 +1837,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
-  // ('auto' or omitted). Logged with every request row so pinned vs auto
-  // traffic and failover overrides are visible.
-  const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
+  // ('auto' or omitted). When a combo is resolved, use the combo name instead of
+  // the requested model id so analytics show the combo name.
+  const pinnedModelId = resolvedCombo?.name
+    ?? (requestedModel && !isAutoModel(requestedModel) ? requestedModel : null);
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one.
   // The attempt iteration, cooldown/skip/penalty bookkeeping, and exhaustion
@@ -1666,7 +1878,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, !!resolvedCombo);
     },
     dispatch: async (route, attempt) => {
     const modelKey = `${route.platform}:${route.modelId}`;
