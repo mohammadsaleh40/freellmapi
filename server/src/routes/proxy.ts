@@ -3,7 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, ModelListRow } from '@freellmapi/shared/types.js';
-import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
+import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
@@ -22,12 +22,13 @@ import { logRequest } from '../lib/request-log.js';
 import { captureRequestBody, logDetailedEvent, summarizeResponse, getLogPath } from '../lib/detailed-log.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue, safeHeaderValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { samplingParamSchemaFields, pickSamplingParams, supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { enforceJsonContent } from '../lib/structured-output.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
-import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from '../services/model-groups.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch, resolveRequestedIdToMembers } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
@@ -220,9 +221,11 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
   // By default we return the WHOLE catalog (one row per model id), each tagged
   // with whether it is currently usable, so a client can see everything and know
-  // what's connected vs. disabled/keyless (#242). `?available=true` (alias
-  // `?connected=true`) narrows the list to only models that can serve a request
-  // right now — the previous default behavior. `available` is computed as
+  // what's connected vs. disabled/keyless (#242). `?available=true` (aliases
+  // `?connected=true`, `?ready=true`) narrows the list to only models that can
+  // serve a request right now — the previous default behavior. The `ready`
+  // alias is the machine-readable filter a meta-gateway uses (#433) to ask
+  // "which models can this instance actually serve now". `available` is computed as
   // "enabled AND an enabled key can serve it"; dedup prefers an available
   // instance of a model id over a disabled/keyless one.
   // Shared catalog listing (one source of truth for the OpenAI and Anthropic
@@ -233,7 +236,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   // conservative default and truncate long inputs before they reach us (#282).
   const { models: allListed, autoContextWindow } = buildModelListing();
 
-  const q = String(req.query.available ?? req.query.connected ?? '').toLowerCase();
+  const q = String(req.query.available ?? req.query.connected ?? req.query.ready ?? '').toLowerCase();
   const onlyAvailable = q === '1' || q === 'true' || q === 'yes';
   const listed = onlyAvailable ? allListed.filter(m => m.available === 1) : allListed;
 
@@ -577,7 +580,7 @@ proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
       input: parsed.data.input, voice: parsed.data.voice, format: parsed.data.response_format,
     });
     res.setHeader('Content-Type', result.contentType);
-    res.setHeader('X-Provider', result.platform);
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
     res.send(result.audio);
   } catch (err: any) {
     const status = err instanceof MediaError ? err.status : 502;
@@ -684,8 +687,8 @@ proxyRouter.post('/audio/transcriptions', (req: Request, res: Response, next) =>
       temperature,
       responseFormat,
     });
-    res.setHeader('X-Provider', result.platform);
-    res.setHeader('X-Model', result.modelId);
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
+    res.setHeader('X-Model', safeHeaderValue(result.modelId));
     if (responseFormat === 'text') {
       res.type('text/plain').send(result.text);
       return;
@@ -829,9 +832,10 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
   if (!isAutoModel(requestedModel) && requestedModel) {
     const db = getDb();
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
@@ -935,7 +939,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
           setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const frame of buffered) res.write(`data: ${JSON.stringify(frame)}\n\n`);
@@ -1060,7 +1064,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       const totalTokens = result.usage?.total_tokens ?? (promptTokens + completionTokens);
       recordUpstreamSuccess(route, totalTokens);
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       res.json({
         id: completionIdFromChat(result.id),
@@ -1471,7 +1475,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (enforced.healed) fusionMsg.content = enforced.content;
         }
       }
-      res.setHeader('X-Routed-Via', routedVia);
+      res.setHeader('X-Routed-Via', safeHeaderValue(routedVia));
       res.json(response);
     } catch (err: any) {
       if (err instanceof FusionError) {
@@ -1675,113 +1679,98 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let stickyStrategyKey: string | undefined = strategyKey;
 
   if (isAutoModel(requestedModel)) {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
-  } else if (resolvedCombo && (resolvedCombo.strategy === 'fallback' || resolvedCombo.strategy === 'round-robin')) {
-    // ── Fallback / round-robin combo: build a strict chain from the combo's model list ──
-    // Fallback: the loop iterates only these models in order.
-    // Round-robin: picks exactly one model per request via rotation.
-    // Both override any auto-resolved chain.
-    const db = getDb();
-    const modelIds = resolvedCombo.models;
-
-    // Resolve each combo model to a DB id. When unify is ON, the combo's model
-    // list may contain canonical short names (e.g. 'gemini-2.5-flash') instead
-    // of catalog model_ids ('google/gemini-2.5-flash'). Resolve via model
-    // groups first, then fall back to exact model_id match.
-    const groups = isUnifyEnabled() ? getModelGroups() : null;
-    const resolvedDbIds: number[] = [];
-    const modelIdToDbId = new Map<string, number>();
-
-    for (const mid of modelIds) {
-      const members = groups ? resolveRequestedIdToMembers(mid, groups) : null;
-      if (members && members.length > 0) {
-        // Canonical name resolved — take the first member to represent it
-        resolvedDbIds.push(members[0]);
-        modelIdToDbId.set(mid, members[0]);
-      } else {
-        // Exact model_id fallback: map to any enabled row
-        const row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(mid) as { id: number } | undefined;
-        if (row) {
-          resolvedDbIds.push(row.id);
-          modelIdToDbId.set(mid, row.id);
+      preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
+    } else if (resolvedCombo && (resolvedCombo.strategy === 'fallback' || resolvedCombo.strategy === 'round-robin')) {
+      const db = getDb();
+      const modelIds = resolvedCombo.models;
+    
+      const groups = isUnifyEnabled() ? getModelGroups() : null;
+      const resolvedDbIds: number[] = [];
+      const modelIdToDbId = new Map<string, number>();
+    
+      for (const mid of modelIds) {
+        const members = groups ? resolveRequestedIdToMembers(mid, groups) : null;
+        
+        if (members && members.length > 0) {
+          resolvedDbIds.push(members[0]);
+          modelIdToDbId.set(mid, members[0]);
+        } else {
+          const row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(mid) as { id: number } | undefined;
+          if (row) {
+            resolvedDbIds.push(row.id);
+            modelIdToDbId.set(mid, row.id);
+          }
         }
       }
-    }
-
-    if (resolvedDbIds.length === 0) {
-      res.status(503).json({
-        error: {
-          message: `Combo "${resolvedCombo.name}" has no enabled models. Enable at least one model in the combo.`,
-          type: 'service_unavailable',
-          code: 'combo_no_models',
-        },
-      });
-      return;
-    }
-
-    // Fetch full ChainRow[] for the resolved db ids, preserving combo order
-    const idPlaceholders = resolvedDbIds.map(() => '?').join(',');
-    const comboRows = db.prepare(`
-      SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
-             1 as enabled,
-             m.platform, m.model_id, m.display_name, m.intelligence_rank,
-             m.size_label, m.monthly_token_budget,
-             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id
-      FROM models m
-      LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.id IN (${idPlaceholders}) AND m.enabled = 1
-    `).all(...resolvedDbIds) as ChainRow[];
-
-    // Sort comboRows to match the combo's original model order
-    const dbIdOrder = new Map(resolvedDbIds.map((id, i) => [id, i]));
-    comboRows.sort((a, b) => (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999));
-
-    // ── Capability auto-switch ──
-    // If the request has images, reorder combo models to prefer vision-capable ones first.
-    if (hasImage && comboRows.length > 1) {
-      const visionModelIds = new Set(
-        (db.prepare(`SELECT DISTINCT model_id FROM models WHERE supports_vision = 1 AND enabled = 1`).all() as { model_id: string }[]).map(r => r.model_id)
-      );
-      comboRows.sort((a, b) => {
-        const aVision = visionModelIds.has(a.model_id) ? 0 : 1;
-        const bVision = visionModelIds.has(b.model_id) ? 0 : 1;
-        if (aVision !== bVision) return aVision - bVision;
-        return (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999);
-      });
-    }
-
-    if (resolvedCombo.strategy === 'round-robin') {
-      // ── Round-robin: pick exactly one model from the combo via rotation ──
-      const idx = nextRoundRobinModel(resolvedCombo.name, comboRows.length, resolvedCombo.stickyLimit);
-      const chosen = comboRows[idx];
-      if (!chosen) {
+    
+      if (resolvedDbIds.length === 0) {
         res.status(503).json({
           error: {
-            message: `Combo "${resolvedCombo.name}" round-robin produced an empty slot.`,
-            type: 'server_error',
-            code: 'combo_rr_empty',
+            message: `Combo "${resolvedCombo.name}" has no enabled models. Enable at least one model in the combo.`,
+            type: 'service_unavailable',
+            code: 'combo_no_models',
           },
         });
         return;
       }
-      preferredModel = chosen.model_db_id;
-      groupChain = undefined;
-      console.log(`[Proxy] Round-robin combo "${resolvedCombo.name}" → ${chosen.model_id} (index ${idx}, ${comboRows.length} models)`);
-    } else {
-      // ── Fallback: use the full combo model list as a strict chain ──
-      // The SQL query above already returns ChainRow-compatible data.
-      groupChain = comboRows;
-      preferredModel = undefined;
-    }
+    
+      const idPlaceholders = resolvedDbIds.map(() => '?').join(',');
+      const comboRows = db.prepare(`
+        SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
+              1 as enabled,
+              m.platform, m.model_id, m.display_name, m.intelligence_rank,
+              m.size_label, m.monthly_token_budget,
+              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+              m.supports_tools, m.context_window, m.key_id
+        FROM models m
+        LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+        WHERE m.id IN (${idPlaceholders}) AND m.enabled = 1
+      `).all(...resolvedDbIds) as ChainRow[];
+    
+      const dbIdOrder = new Map(resolvedDbIds.map((id, i) => [id, i]));
+      comboRows.sort((a, b) => (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999));
+    
+      if (hasImage && comboRows.length > 1) {
+        const visionModelIds = new Set(
+          (db.prepare(`SELECT DISTINCT model_id FROM models WHERE supports_vision = 1 AND enabled = 1`).all() as { model_id: string }[]).map(r => r.model_id)
+        );
+        comboRows.sort((a, b) => {
+          const aVision = visionModelIds.has(a.model_id) ? 0 : 1;
+          const bVision = visionModelIds.has(b.model_id) ? 0 : 1;
+          if (aVision !== bVision) return aVision - bVision;
+          return (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999);
+        });
+      }
+    
+      if (resolvedCombo.strategy === 'round-robin') {
+        const idx = nextRoundRobinModel(resolvedCombo.name, comboRows.length, resolvedCombo.stickyLimit);
+        const chosen = comboRows[idx];
+        if (!chosen) {
+          res.status(503).json({
+            error: {
+              message: `Combo "${resolvedCombo.name}" round-robin produced an empty slot.`,
+              type: 'server_error',
+              code: 'combo_rr_empty',
+            },
+          });
+          return;
+        }
+        preferredModel = chosen.model_db_id;
+        groupChain = undefined;
+        console.log(`[Proxy] Round-robin combo "${resolvedCombo.name}" → ${chosen.model_id} (index ${idx}, ${comboRows.length} models)`);
+      } else {
+        groupChain = comboRows;
+        preferredModel = undefined;
+      }
   } else if (requestedModel) {
     const db = getDb();
     // Unify ON: a requested id (canonical slug OR any provider's model_id) maps
     // to the whole logical-model group, and we route STRICTLY across only its
     // providers — failing over between them, never to a different model (#335).
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         // Distinguish a catalog-disabled model (404 model_not_found, OpenAI
         // semantics) from one whose providers are present but unusable
@@ -1833,7 +1822,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     }
   } else {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -1946,7 +1935,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
           setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
@@ -2333,7 +2322,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
         setFallbackHeaders(res, attempt, attemptLog);
         // Repair double-encoded tool arguments against the request's tool
         // schemas (e.g. GLM emitting an array parameter as a JSON string),
