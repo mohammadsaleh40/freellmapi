@@ -3,7 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, ModelListRow } from '@freellmapi/shared/types.js';
-import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
+import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
@@ -15,17 +15,20 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
+import { resolveCombo } from '../services/combos.js';
+import { nextRoundRobinModel } from '../services/round-robin.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { captureRequestBody, logDetailedEvent, summarizeResponse, getLogPath } from '../lib/detailed-log.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue, safeHeaderValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { samplingParamSchemaFields, pickSamplingParams, supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { enforceJsonContent } from '../lib/structured-output.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
-import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from '../services/model-groups.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch, resolveRequestedIdToMembers } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
@@ -41,6 +44,16 @@ function isAutoModel(modelId: string | undefined): boolean {
   if (!modelId) return true;
   const lower = modelId.toLowerCase();
   return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+}
+
+/** True when the model id is a user-defined combo name (not 'auto', 'fusion', or a platform:model_id pair). */
+function isComboModel(modelId: string | undefined): boolean {
+  if (!modelId) return false;
+  const lower = modelId.toLowerCase();
+  if (lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`)) return false;
+  if (lower === FUSION_MODEL_ID || lower.startsWith(`${FUSION_MODEL_ID}:`)) return false;
+  if (modelId.includes('/')) return false;
+  return resolveCombo(getDb(), modelId) !== null;
 }
 
 // Constant-time string comparison for the unified API key. Plain `===` leaks
@@ -208,9 +221,11 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
   // By default we return the WHOLE catalog (one row per model id), each tagged
   // with whether it is currently usable, so a client can see everything and know
-  // what's connected vs. disabled/keyless (#242). `?available=true` (alias
-  // `?connected=true`) narrows the list to only models that can serve a request
-  // right now — the previous default behavior. `available` is computed as
+  // what's connected vs. disabled/keyless (#242). `?available=true` (aliases
+  // `?connected=true`, `?ready=true`) narrows the list to only models that can
+  // serve a request right now — the previous default behavior. The `ready`
+  // alias is the machine-readable filter a meta-gateway uses (#433) to ask
+  // "which models can this instance actually serve now". `available` is computed as
   // "enabled AND an enabled key can serve it"; dedup prefers an available
   // instance of a model id over a disabled/keyless one.
   // Shared catalog listing (one source of truth for the OpenAI and Anthropic
@@ -221,7 +236,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   // conservative default and truncate long inputs before they reach us (#282).
   const { models: allListed, autoContextWindow } = buildModelListing();
 
-  const q = String(req.query.available ?? req.query.connected ?? '').toLowerCase();
+  const q = String(req.query.available ?? req.query.connected ?? req.query.ready ?? '').toLowerCase();
   const onlyAvailable = q === '1' || q === 'true' || q === 'yes';
   const listed = onlyAvailable ? allListed.filter(m => m.available === 1) : allListed;
 
@@ -565,7 +580,7 @@ proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
       input: parsed.data.input, voice: parsed.data.voice, format: parsed.data.response_format,
     });
     res.setHeader('Content-Type', result.contentType);
-    res.setHeader('X-Provider', result.platform);
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
     res.send(result.audio);
   } catch (err: any) {
     const status = err instanceof MediaError ? err.status : 502;
@@ -672,8 +687,8 @@ proxyRouter.post('/audio/transcriptions', (req: Request, res: Response, next) =>
       temperature,
       responseFormat,
     });
-    res.setHeader('X-Provider', result.platform);
-    res.setHeader('X-Model', result.modelId);
+    res.setHeader('X-Provider', safeHeaderValue(result.platform));
+    res.setHeader('X-Model', safeHeaderValue(result.modelId));
     if (responseFormat === 'text') {
       res.type('text/plain').send(result.text);
       return;
@@ -817,9 +832,10 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
   if (!isAutoModel(requestedModel) && requestedModel) {
     const db = getDb();
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
         const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
@@ -923,7 +939,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
           setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const frame of buffered) res.write(`data: ${JSON.stringify(frame)}\n\n`);
@@ -1048,7 +1064,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       const totalTokens = result.usage?.total_tokens ?? (promptTokens + completionTokens);
       recordUpstreamSuccess(route, totalTokens);
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       res.json({
         id: completionIdFromChat(result.id),
@@ -1459,13 +1475,114 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (enforced.healed) fusionMsg.content = enforced.content;
         }
       }
-      res.setHeader('X-Routed-Via', routedVia);
+      res.setHeader('X-Routed-Via', safeHeaderValue(routedVia));
       res.json(response);
     } catch (err: any) {
       if (err instanceof FusionError) {
         res.status(err.status).json({ error: { message: err.message, type: err.status === 429 ? 'rate_limit_error' : 'invalid_request_error' } });
       } else {
         res.status(502).json({ error: { message: `fusion error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'server_error' } });
+      }
+    }
+    return;
+  }
+
+  // ── Combo: named model groups ──────────────────────────────────────────────
+  // A combo is a user-defined ordered list of models with a routing strategy.
+  // Fusion combos are handled immediately (early return). Fallback and
+  // round-robin combos inject state consumed by the model-resolution block below.
+  const resolvedCombo = requestedModel && !isAutoModel(requestedModel) && !isFusionModel(requestedModel)
+    ? resolveCombo(getDb(), requestedModel)
+    : null;
+
+  if (resolvedCombo && resolvedCombo.strategy === 'fusion') {
+    if (hasImage) {
+      res.status(422).json({
+        error: {
+          message: `Combo "${resolvedCombo.name}" uses fusion strategy, which does not support image input yet. Use a vision model or a fallback-strategy combo directly.`,
+          type: 'invalid_request_error',
+          code: 'combo_fusion_no_vision',
+        },
+      });
+      return;
+    }
+    const fusionOptions = { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams };
+    const comboFusionConfig = {
+      models: resolvedCombo.models,
+      judge: resolvedCombo.judgeModel ?? undefined,
+      strategy: 'synthesize' as const,
+      expose_panel: false,
+    };
+
+    if (stream) {
+      // ── Streaming fusion combo ──
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const writeFrame = (o: unknown) => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch { /* socket gone */ } };
+      const streamId = `combo-${resolvedCombo.name}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const base = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: resolvedCombo.name };
+      let answerStarted = false;
+      try {
+        const { response } = await runFusion({
+          messages, config: comboFusionConfig, options: fusionOptions, estimatedTokens: estimatedTotal,
+          hooks: {
+            onPanel: (a) => writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: null }], _fusion: { event: 'panel', ...a } }),
+            onJudge: (j) => writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: null }], _fusion: { event: 'judge', ...j } }),
+            onJudgeDelta: (delta) => {
+              if (!answerStarted) { writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }); answerStarted = true; }
+              writeFrame({ ...base, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
+            },
+          },
+        });
+        const finalMsg = response.choices[0]?.message;
+        const finalToolCalls = (finalMsg as { tool_calls?: ChatToolCall[] } | undefined)?.tool_calls;
+        const hasFinalToolCalls = Array.isArray(finalToolCalls) && finalToolCalls.length > 0;
+        if (hasFinalToolCalls) {
+          writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+          writeFrame({ ...base, choices: [{ index: 0, delta: { tool_calls: finalToolCalls }, finish_reason: null }] });
+          writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: response.usage });
+        } else {
+          if (!answerStarted) {
+            const finalText = contentToString(finalMsg?.content ?? '');
+            writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+            writeFrame({ ...base, choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }] });
+          }
+          writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: response.usage });
+        }
+      } catch (err: any) {
+        const message = err instanceof FusionError ? err.message : `combo fusion error: ${sanitizeProviderErrorMessage(err?.message)}`;
+        const type = err instanceof FusionError && err.status === 429 ? 'rate_limit_error' : 'server_error';
+        writeFrame({ error: { message, type } });
+      }
+      try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+      return;
+    }
+
+    // ── Non-streaming fusion combo ──
+    try {
+      const { response, routedVia } = await runFusion({
+        messages, config: comboFusionConfig, options: fusionOptions, estimatedTokens: estimatedTotal,
+      });
+      const fusionMsg = (response as any)?.choices?.[0]?.message;
+      if (samplingParams.response_format && fusionMsg && !fusionMsg.tool_calls?.length) {
+        const fusionText = contentToString(fusionMsg.content ?? '');
+        if (fusionText) {
+          const enforced = enforceJsonContent(fusionText);
+          if (!enforced.ok) {
+            res.status(502).json({ error: { message: `combo fusion produced non-JSON output despite response_format=${samplingParams.response_format.type} — retry, or use a non-fusion combo`, type: 'server_error' } });
+            return;
+          }
+          if (enforced.healed) fusionMsg.content = enforced.content;
+        }
+      }
+      res.setHeader('X-Routed-Via', `${resolvedCombo.name} (fusion): ${routedVia}`);
+      res.json(response);
+    } catch (err: any) {
+      if (err instanceof FusionError) {
+        res.status(err.status).json({ error: { message: err.message, type: err.status === 429 ? 'rate_limit_error' : 'invalid_request_error' } });
+      } else {
+        res.status(502).json({ error: { message: `combo fusion error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'server_error' } });
       }
     }
     return;
@@ -1562,15 +1679,98 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let stickyStrategyKey: string | undefined = strategyKey;
 
   if (isAutoModel(requestedModel)) {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+      preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
+    } else if (resolvedCombo && (resolvedCombo.strategy === 'fallback' || resolvedCombo.strategy === 'round-robin')) {
+      const db = getDb();
+      const modelIds = resolvedCombo.models;
+    
+      const groups = isUnifyEnabled() ? getModelGroups() : null;
+      const resolvedDbIds: number[] = [];
+      const modelIdToDbId = new Map<string, number>();
+    
+      for (const mid of modelIds) {
+        const members = groups ? resolveRequestedIdToMembers(mid, groups) : null;
+        
+        if (members && members.length > 0) {
+          resolvedDbIds.push(members[0]);
+          modelIdToDbId.set(mid, members[0]);
+        } else {
+          const row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(mid) as { id: number } | undefined;
+          if (row) {
+            resolvedDbIds.push(row.id);
+            modelIdToDbId.set(mid, row.id);
+          }
+        }
+      }
+    
+      if (resolvedDbIds.length === 0) {
+        res.status(503).json({
+          error: {
+            message: `Combo "${resolvedCombo.name}" has no enabled models. Enable at least one model in the combo.`,
+            type: 'service_unavailable',
+            code: 'combo_no_models',
+          },
+        });
+        return;
+      }
+    
+      const idPlaceholders = resolvedDbIds.map(() => '?').join(',');
+      const comboRows = db.prepare(`
+        SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
+              1 as enabled,
+              m.platform, m.model_id, m.display_name, m.intelligence_rank,
+              m.size_label, m.monthly_token_budget,
+              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+              m.supports_tools, m.context_window, m.key_id
+        FROM models m
+        LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+        WHERE m.id IN (${idPlaceholders}) AND m.enabled = 1
+      `).all(...resolvedDbIds) as ChainRow[];
+    
+      const dbIdOrder = new Map(resolvedDbIds.map((id, i) => [id, i]));
+      comboRows.sort((a, b) => (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999));
+    
+      if (hasImage && comboRows.length > 1) {
+        const visionModelIds = new Set(
+          (db.prepare(`SELECT DISTINCT model_id FROM models WHERE supports_vision = 1 AND enabled = 1`).all() as { model_id: string }[]).map(r => r.model_id)
+        );
+        comboRows.sort((a, b) => {
+          const aVision = visionModelIds.has(a.model_id) ? 0 : 1;
+          const bVision = visionModelIds.has(b.model_id) ? 0 : 1;
+          if (aVision !== bVision) return aVision - bVision;
+          return (dbIdOrder.get(a.model_db_id) ?? 999) - (dbIdOrder.get(b.model_db_id) ?? 999);
+        });
+      }
+    
+      if (resolvedCombo.strategy === 'round-robin') {
+        const idx = nextRoundRobinModel(resolvedCombo.name, comboRows.length, resolvedCombo.stickyLimit);
+        const chosen = comboRows[idx];
+        if (!chosen) {
+          res.status(503).json({
+            error: {
+              message: `Combo "${resolvedCombo.name}" round-robin produced an empty slot.`,
+              type: 'server_error',
+              code: 'combo_rr_empty',
+            },
+          });
+          return;
+        }
+        preferredModel = chosen.model_db_id;
+        groupChain = undefined;
+        console.log(`[Proxy] Round-robin combo "${resolvedCombo.name}" → ${chosen.model_id} (index ${idx}, ${comboRows.length} models)`);
+      } else {
+        groupChain = comboRows;
+        preferredModel = undefined;
+      }
   } else if (requestedModel) {
     const db = getDb();
     // Unify ON: a requested id (canonical slug OR any provider's model_id) maps
     // to the whole logical-model group, and we route STRICTLY across only its
     // providers — failing over between them, never to a different model (#335).
-    const members = isUnifyEnabled() ? resolveRequestedIdToMembers(requestedModel, getModelGroups()) : null;
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
     if (members && members.length > 0) {
-      groupChain = resolveModelGroupCandidates(members);
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         // Distinguish a catalog-disabled model (404 model_not_found, OpenAI
         // semantics) from one whose providers are present but unusable
@@ -1622,13 +1822,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     }
   } else {
-    preferredModel = getStickyModel(messages, sessionIdHeader, strategyKey);
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
-  // ('auto' or omitted). Logged with every request row so pinned vs auto
-  // traffic and failover overrides are visible.
-  const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
+  // ('auto' or omitted). When a combo is resolved, use the combo name instead of
+  // the requested model id so analytics show the combo name.
+  const pinnedModelId = resolvedCombo?.name
+    ?? (requestedModel && !isAutoModel(requestedModel) ? requestedModel : null);
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one.
   // The attempt iteration, cooldown/skip/penalty bookkeeping, and exhaustion
@@ -1666,7 +1867,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, !!resolvedCombo);
     },
     dispatch: async (route, attempt) => {
     const modelKey = `${route.platform}:${route.modelId}`;
@@ -1734,7 +1935,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
           setFallbackHeaders(res, attempt, attemptLog);
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
@@ -2121,7 +2322,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
         setFallbackHeaders(res, attempt, attemptLog);
         // Repair double-encoded tool arguments against the request's tool
         // schemas (e.g. GLM emitting an array parameter as a JSON string),

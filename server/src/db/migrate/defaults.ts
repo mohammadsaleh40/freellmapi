@@ -15,6 +15,10 @@ import * as mediaModelMeta from '../migrations/20260726_000004_media_model_meta.
 import * as requestServedModel from '../migrations/20260726_000005_request_served_model.js';
 import * as attemptErrorSummary from '../migrations/20260726_000006_attempt_error_summary.js';
 import * as agentCompatibility from '../migrations/20260727_000001_agent_compatibility.js';
+import * as combos from '../migrations/20260729_000001_combos.js';
+import * as tombstoneProvenance from '../migrations/20260728_000001_tombstone_provenance.js';
+import * as customModelEndpointIdentity from '../migrations/20260729_000001_custom_model_endpoint_identity.js';
+
 
 export interface MigrationModule {
   up(db: Db): void;
@@ -42,6 +46,10 @@ export const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
 export const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
 export const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
 export const AGENT_COMPATIBILITY_FILENAME = '20260727_000001_agent_compatibility.ts';
+export const COMBOS_FILENAME = '20260729_000001_combos.ts';
+export const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
+export const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
+
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: LEGACY_BASELINE_FILENAME, module: legacyBaseline },
@@ -60,4 +68,7 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: REQUEST_SERVED_MODEL_FILENAME, module: requestServedModel },
   { filename: ATTEMPT_ERROR_SUMMARY_FILENAME, module: attemptErrorSummary },
   { filename: AGENT_COMPATIBILITY_FILENAME, module: agentCompatibility },
+  { filename: COMBOS_FILENAME, module: combos },
+  { filename: TOMBSTONE_PROVENANCE_FILENAME, module: tombstoneProvenance },
+  { filename: CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME, module: customModelEndpointIdentity },
 ];
