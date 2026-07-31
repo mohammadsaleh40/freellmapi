@@ -71,6 +71,11 @@ export function createApp(config?: Config) {
   // are hashed by the Vite/React build, so 'self' works in production. Inline
   // styles from React hydration need 'unsafe-inline'. HSTS stays off because
   // this is a single-user local proxy served over HTTP (see README).
+  // upgradeInsecureRequests: null — helmet adds upgrade-insecure-requests by
+  // default, which makes browsers rewrite every http:// subresource to https://.
+  // This gateway is served over plain HTTP on a LAN (no TLS), so that rewrite
+  // would break the React bundle entirely (white page). Kept as an explicit
+  // opt-out so the rest of the policy stays active.
   app.use(helmet({
     contentSecurityPolicy: {
       directives: {
@@ -82,6 +87,7 @@ export function createApp(config?: Config) {
         fontSrc: ["'self'"],
         formAction: ["'self'"],
         baseUri: ["'self'"],
+        upgradeInsecureRequests: null,
       },
     },
     hsts: false,
