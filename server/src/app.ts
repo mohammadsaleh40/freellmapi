@@ -100,6 +100,7 @@ export function createApp(config?: Config) {
   // are hashed by the Vite/React build, so 'self' works in production. Inline
   // styles from React hydration need 'unsafe-inline'. HSTS stays off because
   // this is a single-user local proxy served over HTTP (see README).
+  //
   // `upgrade-insecure-requests` is emitted by Helmet by default; v0.6.6's
   // CSP hardening (#498) inherited it and broke HTTP LAN installs because the
   // browser rewrites /assets/* to https:// on an origin that has no TLS,
