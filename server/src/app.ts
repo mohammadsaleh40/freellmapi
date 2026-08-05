@@ -100,11 +100,18 @@ export function createApp(config?: Config) {
   // are hashed by the Vite/React build, so 'self' works in production. Inline
   // styles from React hydration need 'unsafe-inline'. HSTS stays off because
   // this is a single-user local proxy served over HTTP (see README).
-  // upgradeInsecureRequests: null — helmet adds upgrade-insecure-requests by
-  // default, which makes browsers rewrite every http:// subresource to https://.
-  // This gateway is served over plain HTTP on a LAN (no TLS), so that rewrite
-  // would break the React bundle entirely (white page). Kept as an explicit
-  // opt-out so the rest of the policy stays active.
+  // `upgrade-insecure-requests` is emitted by Helmet by default; v0.6.6's
+  // CSP hardening (#498) inherited it and broke HTTP LAN installs because the
+  // browser rewrites /assets/* to https:// on an origin that has no TLS,
+  // producing ERR_SSL_PROTOCOL_ERROR and a blank dashboard (#682).
+  // The directive is dropped from the static Helmet config and re-added per
+  // request below, gated by protocol + the CSP_UPGRADE_INSECURE_REQUESTS env.
+  //
+  // Cross-Origin-Opener-Policy and Origin-Agent-Cluster are handled the same
+  // way, for the same reason: both only apply to secure contexts, so on a
+  // plain-HTTP LAN origin the browser discards them and logs a console error
+  // instead (#734). They are re-added per request whenever the origin is one
+  // the browser trusts — HTTPS, or loopback, which covers desktop/localhost.
   app.use(helmet({
     contentSecurityPolicy: {
       directives: {
