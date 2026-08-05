@@ -243,6 +243,22 @@ function parseSize(size?: string): [number, number] {
   return [1024, 1024];
 }
 
+/** Per-model adapter metadata (mirrors TranscriptionMeta's requestStyle). */
+interface MediaMeta {
+  /** 'multipart' = send form-data (FLUX.2-family image models); absent = JSON. */
+  requestStyle?: string | null;
+}
+
+function parseMediaMeta(raw: string | null): MediaMeta {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as MediaMeta;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function parseCfKey(key: string | null): { accountId: string; token: string } {
   if (!key) throw new MediaError('cloudflare key required (account_id:token)', 401);
   const sep = key.indexOf(':');
@@ -332,10 +348,27 @@ async function callImageProvider(
     }
     case 'cloudflare': {
       const { accountId, token } = parseCfKey(key);
+      const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+      let body: RequestInit['body'];
+      if (parseMediaMeta(row.meta_json).requestStyle === 'multipart') {
+        // FLUX.2-family models require multipart/form-data input — a JSON
+        // body 400s with "required properties at '/' are 'multipart'".
+        // fetch() sets the boundary when Content-Type is left unset.
+        const fd = new FormData();
+        fd.append('prompt', p.prompt);
+        if (p.size && /^\d+x\d+$/.test(p.size)) {
+          fd.append('width', String(w));
+          fd.append('height', String(h));
+        }
+        body = fd;
+      } else {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({ prompt: p.prompt, width: w, height: h });
+      }
       const r = await mediaFetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${row.model_id}`, 'cloudflare', 'image', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ prompt: p.prompt, width: w, height: h }),
+        headers,
+        body,
       });
       // FLUX returns JSON { result: { image: <b64> } }; SDXL returns raw PNG bytes.
       const ct = r.headers.get('content-type') ?? '';
