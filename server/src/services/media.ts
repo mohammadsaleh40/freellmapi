@@ -266,6 +266,20 @@ function parseCfKey(key: string | null): { accountId: string; token: string } {
   return { accountId: key.slice(0, sep), token: key.slice(sep + 1) };
 }
 
+/** Adapter request flavor for a generative media row, read from meta_json.
+ *  One platform can host several deployment styles: Cloudflare takes a JSON
+ *  body for most image models but multipart/form-data for the FLUX.2 family.
+ *  Absent meta = the platform's default style, so old rows are untouched. */
+function mediaRequestStyle(row: MediaModelRow): string | null {
+  if (!row.meta_json) return null;
+  try {
+    const parsed = JSON.parse(row.meta_json) as { requestStyle?: unknown };
+    return typeof parsed?.requestStyle === 'string' ? parsed.requestStyle : null;
+  } catch {
+    return null;
+  }
+}
+
 function contentTypeFor(fmt: string): string {
   switch (fmt) {
     case 'wav': return 'audio/wav';

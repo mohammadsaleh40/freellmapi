@@ -18,6 +18,7 @@ import * as agentCompatibility from '../migrations/20260727_000001_agent_compati
 import * as combos from '../migrations/20260729_000001_combos.js';
 import * as tombstoneProvenance from '../migrations/20260728_000001_tombstone_provenance.js';
 import * as customModelEndpointIdentity from '../migrations/20260729_000001_custom_model_endpoint_identity.js';
+import * as customEndpointHostLabels from '../migrations/20260802_000001_custom_endpoint_host_labels.js';
 
 
 export interface MigrationModule {
@@ -49,6 +50,7 @@ export const AGENT_COMPATIBILITY_FILENAME = '20260727_000001_agent_compatibility
 export const COMBOS_FILENAME = '20260729_000001_combos.ts';
 export const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
 export const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
+export const CUSTOM_ENDPOINT_HOST_LABELS_FILENAME = '20260802_000001_custom_endpoint_host_labels.ts';
 
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
@@ -71,4 +73,5 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: COMBOS_FILENAME, module: combos },
   { filename: TOMBSTONE_PROVENANCE_FILENAME, module: tombstoneProvenance },
   { filename: CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME, module: customModelEndpointIdentity },
+  { filename: CUSTOM_ENDPOINT_HOST_LABELS_FILENAME, module: customEndpointHostLabels },
 ];
