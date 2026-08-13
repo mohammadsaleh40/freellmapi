@@ -96,8 +96,80 @@ export function isRetryableError(err: any): boolean {
     // First-byte timeout (#584): the grace budget expired before ANY byte
     // reached the client, so the next candidate can serve it invisibly.
     || msg.includes('no first byte')
-    || msg.includes('unparseable inline tool-call dialect');
+    || msg.includes('unparseable inline tool-call dialect')
+
+    // کد آپستریم برای Tool Validation (مدل آرگومان اشتباه تولید کرده است)
+    || msg.includes('invalid tool arguments')
+    
+    // کد شما برای خطاهای شبکه و TLS
+    || isTransportError(err);
 }
+
+// ── Transport errors via the cause chain (undici / Node sockets) ───────────
+// undici surfaces a connection dropped before the TLS handshake completed as
+// "Client network socket disconnected before secure TLS connection was
+// established" — usually as the CAUSE of a wrapping "fetch failed", but
+// sometimes as the raw error itself. The message-substring rules in
+// isRetryableError can't see inside the cause chain, so a mid-handshake drop
+// used to classify fatal and 502 the client while healthy models sat unused
+// in the fallback chain. Mirror the process-safety-net crash classifier:
+// walk the bounded cause chain and match transport codes + message hints.
+// Every match here is a transient network condition — retrying the next
+// candidate in the chain is always the right move.
+const TRANSPORT_ERROR_CODES = new Set([
+  // Node socket-level codes
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
+  'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL',
+  // undici codes
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT', 'UND_ERR_ABORTED',
+]);
+
+const TRANSPORT_MESSAGE_HINTS = [
+  'fetch failed',
+  'other side closed',
+  'socket hang up',
+  'premature close',
+  'econnreset',
+  'request aborted',
+  // Raw undici wording for a socket dropped before the TLS handshake finished
+  // (observed live 2026-08: deepseek-code combo via SOCKS proxy): the peer
+  // closed the TCP connection mid-handshake — transient, retry the chain.
+  'client network socket disconnected before secure tls connection was established',
+];
+
+/** Walk the error's cause chain (bounded, cycle-safe) collecting codes and
+ * messages — undici wraps the real socket error in `err.cause`, sometimes
+ * nested further. */
+function walkErrorChain(err: any): Array<{ code?: string; message?: string }> {
+  const out: Array<{ code?: string; message?: string }> = [];
+  let cur: any = err;
+  const seen = new Set<unknown>();
+  for (let depth = 0; cur && typeof cur === 'object' && depth < 6; depth++) {
+    if (seen.has(cur)) break;
+    seen.add(cur);
+    out.push({
+      code: typeof cur.code === 'string' ? cur.code : undefined,
+      message: typeof cur.message === 'string' ? cur.message : undefined,
+    });
+    cur = cur.cause;
+  }
+  return out;
+}
+
+/** True when the error (or anything in its cause chain) is a transient
+ * network transport failure: a dropped/reset/timed-out socket, a failed TLS
+ * handshake, or an undici transport code. These say nothing about the request
+ * or the model — the next candidate in the fallback chain can serve it, so
+ * they must be retryable. */
+export function isTransportError(err: any): boolean {
+  if (err == null) return false;
+  const links = walkErrorChain(err);
+  for (const { code } of links) {
+    if (code && TRANSPORT_ERROR_CODES.has(code)) return true;
+  }
+  const joined = links.map(l => l.message ?? '').join(' | ').toLowerCase();
+  return TRANSPORT_MESSAGE_HINTS.some(h => joined.includes(h));}
 
 // A genuine provider QUOTA signal: a structured 429 or rate-limit/quota wording.
 // Distinct from the much broader isRetryableError: timeouts, 5xx, transport
@@ -238,6 +310,42 @@ export function isDailyQuotaExhaustedError(err: any): boolean {
 export function isProviderDegradedError(err: any): boolean {
   const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('degraded');
+}
+
+// #788: provider-level failures — 5xx, timeouts, transport/network errors, a
+// degraded deployment — are symptoms of the PROVIDER being sick, not of this
+// particular key. Retrying the same provider with a sibling key would fail
+// identically, so the fallback loop must skip the WHOLE platform for the
+// request instead of burning one failover hop per key. Key-scoped failures
+// (auth, quota, 403 tier) stay out of here so a dead key can still rotate to
+// a healthy sibling on the same platform.
+//
+// Classified on the STRUCTURED status — every adapter attaches one to an HTTP
+// failure (providerHttpError in providers/base.ts) — plus the two families that
+// carry no status at all: a timeout and a transport-level failure. Deliberately
+// NO bare '500' / '503' / 'unavailable' / 'internal server error' substrings: a
+// token count, a duration ("… took 5003ms") or a key-scoped message naming an
+// unavailable model would each condemn a healthy platform for the whole request.
+// A message check therefore only runs when there is no status to trust.
+export function isProviderLevelError(err: any): boolean {
+  // A failure the thrower explicitly scoped to the MODEL (`skipModelForRequest`
+  // — an ignored response_format, invalid tool arguments) is never provider
+  // health, and its message quotes caller- and model-supplied text: a tool
+  // named `set_timeout`, or an Ajv complaint about an instance path `/timeout`,
+  // would otherwise trip the substring checks below and condemn a healthy
+  // platform for the whole request. The structured marker is authoritative;
+  // the text is not.
+  if (err?.skipModelForRequest === true) return false;
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status >= 500) return true;
+  // A DEGRADED hosted deployment (NVIDIA NIM, #522) is provider health wearing
+  // a 400 — same source of truth as everywhere else, not a second substring.
+  if (isProviderDegradedError(err)) return true;
+  if (status !== 0) return false;
+  const msg = (err?.message ?? '').toLowerCase();
+  return isTimeoutErrorText(msg)
+    || msg.includes('econnrefused') || msg.includes('econnreset')
+    || msg.includes('fetch failed');   // undici transport error (DNS/TLS/proxy down)
 }
 
 // Provider-side 400s are retryable because another provider may accept the same
@@ -407,7 +515,13 @@ export function modelRetirementSignal(err: any): ModelRetirementConfidence | nul
   const msg = (err?.message ?? '').toLowerCase();
   const status = typeof err?.status === 'number' ? err.status : 0;
   const gone = status === 410 || /\berror 410\b/.test(msg) || /\b410 gone\b/.test(msg);
-  if (gone || END_OF_LIFE_PHRASES.some(phrase => msg.includes(phrase))) return 'definitive';
+  // An end-of-life phrase is only definitive when the status agrees the model
+  // is not there. On its own it is just text, and 'definitive' skips the
+  // corroboration gate in noteModelRetirementSignal — so a 429 or 500 whose
+  // body happens to mention a retirement (an advisory notice, a status-page
+  // quote, a message about a DIFFERENT model) disabled a live model on one
+  // response. Unmatched here means it falls through and teaches nothing.
+  if (gone || (isModelNotFoundError(err) && END_OF_LIFE_PHRASES.some(phrase => msg.includes(phrase)))) return 'definitive';
   if (!isModelNotFoundError(err)) return null;
   return MODEL_GONE_PHRASES.some(phrase => msg.includes(phrase)) ? 'probable' : null;
 }
